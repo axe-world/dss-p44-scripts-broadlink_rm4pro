@@ -1,0 +1,112 @@
+<!doctype html>
+<html lang="de"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>BroadLink RF Manager – P44</title>
+<style>
+:root{font:15px system-ui,Segoe UI,sans-serif;color-scheme:dark;background:#101721;color:#e8edf5}*{box-sizing:border-box}body{margin:0}main{max-width:1050px;margin:30px auto;padding:0 20px}header{display:flex;justify-content:space-between;align-items:center;gap:20px;flex-wrap:wrap}h1{font-size:26px;margin:0}h2{font-size:18px;margin:0 0 18px}small,.muted{color:#9aaabd}section{border:1px solid #2a394b;background:#172230;border-radius:14px;padding:22px;margin:20px 0}.toolbar{display:flex;gap:10px;flex-wrap:wrap;align-items:center}.split{display:grid;grid-template-columns:1fr 1fr;gap:18px}label{display:block;margin:12px 0 5px;color:#b7c6d8}input,textarea{width:100%;border:1px solid #3a4d61;background:#0f1925;color:#e8edf5;border-radius:8px;padding:10px;font:inherit}textarea{height:145px;font:12px ui-monospace,monospace;resize:vertical}button{cursor:pointer;border:1px solid #3c5368;background:#26384b;color:#fff;border-radius:8px;padding:10px 13px;font:inherit}button.primary{background:#138b81;border-color:#138b81}button.danger{background:#71353b;border-color:#71353b}button:disabled{opacity:.45;cursor:wait}table{border-collapse:collapse;width:100%}td,th{text-align:left;padding:12px 8px;border-bottom:1px solid #324253}td.actions{text-align:right;white-space:nowrap}th{color:#9aaabd;font-weight:600}code{font:12px ui-monospace,monospace}.pill{display:inline-block;border-radius:30px;background:#26384b;padding:6px 11px;color:#bcd0e0}#message{white-space:pre-wrap;line-height:1.5}#message.error{color:#ff9595}#message.good{color:#91e0bc}.hide{display:none}a{color:#8bd8d3}@media(max-width:740px){.split{grid-template-columns:1fr}td.actions button{padding:6px 8px}table{font-size:13px}}
+</style></head><body><main><header><div><h1>BroadLink RF Manager</h1><p class="muted">P44 · RM4 Pro · 192.168.67.230</p></div><div class="toolbar"><span id="status" class="pill">Nicht verbunden</span><button id="refresh">Aktualisieren</button></div></header>
+<section><div class="toolbar" style="justify-content:space-between"><h2>RF-Codes</h2><button class="primary" id="new">+ Neuer Code</button></div><div style="overflow:auto"><table><thead><tr><th>Action-ID</th><th>Anzeigename</th><th>RF-Code</th><th>Aktionen</th></tr></thead><tbody id="items"><tr><td colspan="4">Verbinde mit P44 …</td></tr></tbody></table></div></section>
+<div class="split"><section><h2 id="editHeading">Code bearbeiten / importieren</h2><label for="id">Action-ID (stabil, keine Leerzeichen)</label><input id="id" maxlength="48" placeholder="z.B. GaragentorAuf" spellcheck="false"><label for="title">Anzeigename in digitalSTROM</label><input id="title" maxlength="100" placeholder="z.B. Garagentor öffnen"><label for="code">BroadLink-Hex-Code</label><textarea id="code" placeholder="b1c0..." spellcheck="false"></textarea><div class="toolbar" style="margin-top:13px"><button class="primary" id="save">Speichern / Action anlegen</button><button id="clear">Zurücksetzen</button></div><p id="editStatus" role="status" style="white-space:pre-wrap;color:#91e0bc;line-height:1.45"></p><p class="muted">Änderungen am Hex-Code ersetzen die Daten dieser Action. Die Action-ID sollte nach einer Zuordnung im dSS nicht geändert werden.</p></section>
+<section><h2>RF-Code einlernen</h2><label for="learnId">Neue Action-ID</label><input id="learnId" placeholder="GaragentorAuf" maxlength="48" spellcheck="false"><label for="learnTitle">Anzeigename</label><input id="learnTitle" placeholder="Garagentor öffnen" maxlength="100"><div class="toolbar" style="margin-top:15px"><button class="primary" id="learn">RF-Lernen starten</button></div><p class="muted">1. Taste lange gedrückt halten, bis eine Frequenz erkannt wird.<br>2. Taste erneut kurz drücken, um den RF-Code aufzuzeichnen.<br>3. Der Code wird gespeichert und die Dynamic Action registriert.</p><p id="phase" class="pill">Lernmodus: Inaktiv</p><p class="muted">Der Lernprozess benötigt bis zu 45 Sekunden. Die Seite aktualisiert den Status automatisch.</p></section></div>
+<section><div class="toolbar" style="justify-content:space-between"><h2>Protokoll / Status</h2><button id="export">JSON-Backup exportieren</button></div><div id="message" class="muted">Bereit.</div><p class="muted">Die Oberfläche nutzt die lokale P44-JSON-API. Nur im geschützten LAN betreiben. Senden und Löschen sind echte Geräteaktionen.</p></section>
+</main><script>
+'use strict';
+// Default matches a page served by the same P44. For file:// testing use the P44's IP.
+const API=(location.protocol==='file:' ? 'http://192.168.67.204' : location.origin)+'/api/json/scriptapi/broadlinkrf';
+const $=id=>document.getElementById(id);let entries={};let polling=null;let editingOriginalId=null;
+function msg(text,error=false){$('message').textContent=text;$('message').className=error?'error':'good';}
+function validId(id){return /^[A-Za-z0-9_]{1,48}$/.test(id)}
+async function api(cmd,values={}){
+ const q=new URLSearchParams({cmd,...values});
+ // URLSearchParams kodiert Leerzeichen als '+'. Die P44 Script-API interpretiert
+ // das Pluszeichen nicht als Leerzeichen. Daher Leerzeichen als %20 senden.
+ // Echte '+'-Zeichen bleiben korrekt als %2B kodiert.
+ const query=q.toString().replace(/\+/g,'%20');
+ const response=await fetch(API+'?'+query,{credentials:'same-origin',cache:'no-store'});
+ if(!response.ok)throw Error('HTTP '+response.status);
+ const raw=await response.json();
+ // P44 JSON API may wrap script API replies into a result object.
+ // Do not report "connected" when the expected payload is absent.
+ let result=raw;
+ if(result && typeof result==='object' && result.result && typeof result.result==='object')result=result.result;
+ if(result && typeof result==='object' && result.response && typeof result.response==='object' && result.response.codes!==undefined)result=result.response;
+ if(!result || typeof result!=='object')throw Error('Unerwartete API-Antwort: '+JSON.stringify(raw).slice(0,350));
+ if(result.ok===false || (raw && raw.ok===false))throw Error(result.error||raw.error||'P44 API-Fehler');
+ if(cmd==='list' || cmd==='status'){
+   if(!Object.prototype.hasOwnProperty.call(result,'codes'))throw Error('API liefert kein Feld codes. Antwort: '+JSON.stringify(raw).slice(0,650));
+   if(!result.codes || typeof result.codes!=='object' || Array.isArray(result.codes))throw Error('Ungültiges codes-Format: '+JSON.stringify(result.codes).slice(0,350));
+ }
+ return result;
+}
+function render(){const tbody=$('items');tbody.replaceChildren();let keys=Object.keys(entries).filter(id=>entries[id]&&entries[id].code).sort((a,b)=>a.localeCompare(b));
+ if(!keys.length){let tr=document.createElement('tr'),td=document.createElement('td');td.colSpan=4;td.textContent='Keine RF-Codes gespeichert';tr.append(td);tbody.append(tr);return;}
+ for(let id of keys){let item=entries[id],tr=document.createElement('tr');for(let value of [id,item.title||id,Math.floor((item.code||'').length/2)+' Bytes']){let td=document.createElement('td');td.textContent=value;tr.append(td)}
+ const tools=document.createElement('td');tools.className='actions';
+ for(let [label,handler] of [['Senden',()=>send(id)],['Bearbeiten',()=>edit(id)],['Löschen',()=>remove(id)]]){let btn=document.createElement('button');btn.textContent=label;btn.onclick=handler;if(label==='Löschen')btn.className='danger';tools.append(btn,' ')}tr.append(tools);tbody.append(tr)}
+}
+async function refresh(silent=false){try{const r=await api('list');entries=r.codes||{};render();$('phase').textContent='Lernmodus: '+(r.phase||'Inaktiv')+(r.busy?' · beschäftigt':'');$('status').textContent=r.busy?'Beschäftigt':'P44 verbunden';if(!silent)msg('Codeverwaltung geladen. '+Object.keys(entries).filter(k=>entries[k]&&entries[k].code).length+' Codes.');if(r.error)msg(r.error,true);else if(r.info&&r.info!=='Bereit'&&r.busy)msg(r.info);}catch(e){$('status').textContent='Nicht erreichbar';if(!silent)msg('API nicht erreichbar: '+e.message+'. Prüfe P44Script und URL.',true)}}
+function edit(id){let c=entries[id];if(!c)return;editingOriginalId=id;$('id').value=id;$('title').value=c.title||id;$('code').value=c.code||'';$('editHeading').textContent='Code bearbeiten: '+id;scrollTo({top:300,behavior:'smooth'})}
+function clear(){editingOriginalId=null;for(let id of ['id','title','code'])$(id).value='';$('editHeading').textContent='Code bearbeiten / importieren';$('editStatus').textContent=''}
+function editMsg(text,error=false){
+ $('editStatus').textContent=text;
+ $('editStatus').style.color=error?'#ff9595':'#91e0bc';
+ msg(text,error);
+}
+async function save(){
+ const id=$('id').value.trim(),title=$('title').value.trim(),code=$('code').value.replace(/\s/g,'');
+ if(!validId(id))return editMsg('Action-ID: nur Buchstaben, Ziffern, Unterstrich (max. 48).',true);
+ if(!title)return editMsg('Anzeigenamen angeben.',true);
+ if(!/^(?:[0-9a-fA-F]{2})+$/.test(code))return editMsg('RF-Code muss ein gerader Hex-String sein.',true);
+ const oldId=editingOriginalId;
+ const original=oldId && entries[oldId] && entries[oldId].code ? entries[oldId] : null;
+ const changedId=!!original && oldId!==id;
+ const originalCodeSame=!!original && original.code.toLowerCase()===code.toLowerCase();
+ const existing=entries[id]&&entries[id].code?entries[id]:null;
+ const sameCode=!!existing && existing.code.toLowerCase()===code.toLowerCase();
+ if(changedId && existing)return editMsg('Die neue Action-ID '+id+' existiert bereits. Wähle eine freie ID.',true);
+ if(changedId && !originalCodeSame)return editMsg('Action-ID und Hex-Code bitte nicht gleichzeitig ändern. Erst die ID umbenennen, danach den RF-Code bearbeiten.',true);
+ if(!changedId && sameCode && existing.title===title)return editMsg('Keine Änderungen vorhanden.');
+ const operation=changedId ? 'Action-ID '+oldId+' in '+id+' umbenennen? Bestehende digitalSTROM-Zuordnungen können davon betroffen sein.' : sameCode ? 'Anzeigenamen aktualisieren?' : 'RF-Code '+id+' speichern / aktualisieren?';
+ if(!confirm(operation))return;
+ const saveBtn=$('save');saveBtn.disabled=true;
+ try{
+   if(changedId){
+     editMsg('Action-ID wird ohne erneute RF-Code-Übertragung umbenannt...');
+     const result=await api('move',{oldId,id,title});
+     if(result.ok!==true)throw Error('Umbenennung nicht bestätigt: '+JSON.stringify(result));
+   }else if(sameCode){
+     editMsg('Anzeigename wird aktualisiert...');
+     const result=await api('rename',{id,title});
+     if(result.ok!==true)throw Error('Titeländerung nicht bestätigt: '+JSON.stringify(result));
+   }else{
+     const begin=await api('uploadBegin',{id,title,total:code.length});
+     if(begin.ok!==true)throw Error('Uploadstart nicht bestätigt: '+JSON.stringify(begin));
+     const chunkSize=320;
+     for(let offset=0,seq=0;offset<code.length;offset+=chunkSize,seq++){
+       const part=code.slice(offset,offset+chunkSize);
+       const response=await api('uploadPart',{id,seq,part});
+       if(response.ok!==true || Number(response.next)!==seq+1)throw Error('Upload-Block '+seq+' nicht bestätigt: '+JSON.stringify(response));
+       editMsg('RF-Code wird übertragen: '+Math.min(offset+chunkSize,code.length)+' / '+code.length+' Hex-Zeichen');
+     }
+     editMsg('Alle Blöcke übertragen. Speichere RF-Code in die JSON-Datei...');
+     const result=await api('uploadCommit',{id});
+     if(result.ok!==true)throw Error('Speichern nicht bestätigt: '+JSON.stringify(result));
+   }
+   const check=await api('list');
+   if(!check.codes[id] || check.codes[id].title!==title ||
+      check.codes[id].code.toLowerCase()!==code.toLowerCase() ||
+      (changedId && check.codes[oldId] && check.codes[oldId].code))
+       throw Error('Nachkontrolle fehlgeschlagen: Die gespeicherten Daten stimmen nicht überein');
+   entries=check.codes;render();editingOriginalId=id;
+   $('editHeading').textContent='Code bearbeiten: '+id;
+   editMsg('Erfolgreich gespeichert: '+id+' – '+title+(changedId?' (alte ID '+oldId+' entfernt)':''));
+ }catch(e){editMsg('Speichern fehlgeschlagen: '+e.message,true);}
+ finally{saveBtn.disabled=false;}
+}
+async function send(id){if(!confirm('RF-Befehl '+id+' wirklich senden?'))return;try{await api('send',{id});msg('Senden gestartet: '+id+' (Ergebnis im P44-Log / Events)');setTimeout(()=>refresh(true),1800)}catch(e){msg(e.message,true)}}
+async function remove(id){if(!confirm('Action '+id+' und gespeicherten RF-Code dauerhaft löschen? Bestehende dSS-Zuordnungen funktionieren danach nicht mehr.'))return;try{await api('remove',{id});msg('Gelöscht: '+id);await refresh(true)}catch(e){msg(e.message,true)}}
+async function learn(){let id=$('learnId').value.trim(),title=$('learnTitle').value.trim();if(!validId(id)||!title)return msg('Gültige neue Action-ID und Anzeigenamen eingeben.',true);if(entries[id])return msg('Diese Action-ID existiert bereits.',true);try{await api('learn',{id,title});msg('Lernen gestartet. Taste jetzt lange gedrückt halten, danach erneut kurz drücken.');await refresh(true)}catch(e){msg('Lernen: '+e.message,true)}}
+function exportData(){let b=new Blob([JSON.stringify(entries,null,2)],{type:'application/json'});let u=URL.createObjectURL(b);let a=document.createElement('a');a.href=u;a.download='broadlink_rf_backup.json';a.click();setTimeout(()=>URL.revokeObjectURL(u),500)}
+$('refresh').onclick=()=>refresh();$('new').onclick=()=>{clear();$('id').focus()};$('save').onclick=save;$('clear').onclick=clear;$('learn').onclick=learn;$('export').onclick=exportData;
+refresh();polling=setInterval(()=>refresh(true),2500);
+</script></body></html>
+

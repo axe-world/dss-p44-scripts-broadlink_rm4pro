@@ -1,0 +1,57 @@
+{
+  "message": "init",
+  "protocol": "json",
+  "name": "Deckentrockner BroadLink",
+  "group": 8,
+  "colorclass": 3,
+  "output": "basic",
+  "oemmodelguid": "gs1:(01)1234567890123",
+  "dynamicactions": {
+    "TrocknerHoch": {
+      "title": "Trockner hoch",
+      "description": "Deckentrockner hochfahren"
+    },
+    "TrocknerRunter": {
+      "title": "Trockner runter",
+      "description": "Deckentrockner herunterfahren"
+    },
+    "TrocknerLicht": {
+      "title": "Trockner Licht",
+      "description": "Licht schalten"
+    },
+    "TrocknerLuefter": {
+      "title": "Trockner Luefter",
+      "description": "Luefter schalten"
+    }
+  },
+  "states": {
+    "Verbindung": {
+      "values": [
+        "Unbekannt",
+        "OK",
+        "Fehler"
+      ],
+      "type": "enumeration",
+      "description": "Letzte BroadLink Kommunikation"
+    },
+    "LetzterBefehl": {
+      "values": [
+        "Keiner",
+        "Hoch",
+        "Runter",
+        "Licht",
+        "Luefter"
+      ],
+      "type": "enumeration",
+      "description": "Letzter gesendeter RF Befehl"
+    }
+  },
+  "events": {
+    "RFGesendet": {
+      "description": "RF-Befehl bestaetigt"
+    },
+    "RFFehler": {
+      "description": "RF-Befehl fehlgeschlagen"
+    }
+  }
+}

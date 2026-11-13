@@ -1,0 +1,69 @@
+{
+  "message": "init",
+  "protocol": "json",
+  "name": "Deckentrockner",
+  "group": 8,
+  "colorclass": 3,
+  "output": "basic",
+  "oemmodelguid": "gs1:(01)1234567890123",
+  "dynamicactions": {
+    "eRFLernen": {
+      "title": "RF lernen",
+      "description": "Startet RF-Lernvorgang"
+    }
+  },
+  "states": {
+    "Verbindung": {
+      "values": [
+        "Unbekannt",
+        "OK",
+        "Fehler"
+      ],
+      "type": "enumeration",
+      "description": "Letzte BroadLink Kommunikation"
+    },
+    "LetzterBefehl": {
+      "values": [
+        "Keiner",
+        "Hoch",
+        "Runter",
+        "Licht",
+        "Luefter"
+      ],
+      "type": "enumeration",
+      "description": "Letzter gesendeter RF Befehl"
+    },
+    "Lernmodus": {
+      "values": [
+        "Inaktiv",
+        "Frequenzsuche",
+        "Empfangen"
+      ],
+      "type": "enumeration",
+      "description": "RF-Lernmodus"
+    },
+    "Lernergebnis": {
+      "values": [
+        "Unbekannt",
+        "Erfolgreich",
+        "Fehler"
+      ],
+      "type": "enumeration",
+      "description": "Ergebnis des letzten Lernvorgangs"
+    }
+  },
+  "events": {
+    "RFGesendet": {
+      "description": "RF-Befehl bestaetigt"
+    },
+    "RFFehler": {
+      "description": "RF-Befehl fehlgeschlagen"
+    },
+    "RFCodeGelernt": {
+      "description": "RF-Code gelernt und persistent gespeichert"
+    },
+    "RFLernfehler": {
+      "description": "RF-Lernvorgang fehlgeschlagen"
+    }
+  }
+}

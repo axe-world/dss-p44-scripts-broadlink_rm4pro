@@ -1,0 +1,181 @@
+// BroadLink RM4 Pro - native P44Script / digitalSTROM
+
+var HOST = "192.168.1.1";  //ANPASSEN !! IP des Broadlink RM4 Pro
+var PORT = 80;
+var KEY0 = binary("097628343fe99e23765c1513accf8b02");
+var IV = binary("562e17996d093d28ddb3ba695a2e6f58");
+var MAC = binary("60faedae0bec");
+var DEVTYPE = binary("1352");
+var KEY = KEY0;
+var DEVICEID = binary("00000000");
+var COUNTER = 0x8000;
+var AUTHENTICATED = false;
+
+// hier müsssen die im Broadlink RM4 pro angelernte RF codes eingetragen werden  !!!
+var RF_HOCH = "";    
+var RF_RUNTER = "";  
+var RF_LICHT = "";    
+var RF_LUEFTER = "";  
+
+function u16(n)
+{
+  return chr(n%256)+chr(int(n/256)%256);
+}
+
+function setBytes(data,pos,value)
+{
+  return substr(data,0,pos)+value+substr(data,pos+strlen(value));
+}
+
+// Checksumme via native String-Operationen statt ~1300 einzelnen
+// ord(substr(...))-Aufrufen in der P44Script-Engine.
+// Fuer jedes Byte wird die Haeufigkeit per replace() bestimmt.
+// Optimierung noch auf der P44 zu benchmarken.
+function checksum(data)
+{
+  var sum = 0xBEAF;
+  var len = strlen(data);
+  for (var b=1; b<256; b++) {
+    var count = len-strlen(replace(data,chr(b),""));
+    sum += b*count;
+  }
+  return sum%65536;
+}
+
+function zeroPad(data)
+{
+  while (strlen(data)%16!=0) data += chr(0);
+  return data;
+}
+
+// BroadLink Zero-Padding mit P44Script AES padding=true emulieren.
+function blEncrypt(data)
+{
+  var padded = zeroPad(data);
+  var encrypted = encrypt("AES-128-CBC",padded,KEY,IV,true);
+  return substr(encrypted,0,strlen(padded));
+}
+
+// An den Ciphertext einen gueltigen PKCS7-Block anhaengen,
+// damit decrypt(...,true) die BroadLink-Daten entschluesseln kann.
+function blDecrypt(data)
+{
+  var n = strlen(data);
+  if (n==0 || n%16!=0) return null;
+  var lastBlock = substr(data,n-16,16);
+  var extra = encrypt("AES-128-CBC",strrep(chr(16),16),KEY,lastBlock,true);
+  return decrypt("AES-128-CBC",data+substr(extra,0,16),KEY,IV,true);
+}
+
+function sendPacket(command,payload)
+{
+  COUNTER = ((COUNTER+1)%32768)+32768;
+  var header = binary("5aa5aa555aa5aa55")+strrep(chr(0),48);
+  header = setBytes(header,0x24,DEVTYPE);
+  header = setBytes(header,0x26,u16(command));
+  header = setBytes(header,0x28,u16(COUNTER));
+  header = setBytes(header,0x2A,MAC);
+  header = setBytes(header,0x30,DEVICEID);
+  header = setBytes(header,0x34,u16(checksum(payload)));
+  var encrypted = blEncrypt(payload);
+  var packet = header+encrypted;
+  packet = setBytes(packet,0x20,u16(checksum(packet)));
+  var udp = udpsocket(HOST,PORT,true,true);
+  udp.send(packet);
+  var response = await(udp.message(),10);
+  if (!isvalid(response) || strlen(response)<56) {
+    log("BroadLink: UDP Timeout / Antwort zu kurz");
+    return null;
+  }
+  var err = ord(substr(response,0x22,1)) + 256*ord(substr(response,0x23,1));
+  if (err!=0) {
+    log("BroadLink: Fehlercode "+err);
+    return null;
+  }
+  return response;
+}
+
+function broadlinkAuth()
+{
+  AUTHENTICATED = false;
+  KEY = KEY0;
+  DEVICEID = binary("00000000");
+  var payload = strrep(chr(0),80);
+  payload = setBytes(payload,4,strrep("1",16));
+  payload = setBytes(payload,0x1E,chr(1));
+  payload = setBytes(payload,0x2D,chr(1));
+  payload = setBytes(payload,0x30,"Test 1");
+  var response = sendPacket(0x65,payload);
+  if (!isvalid(response)) return false;
+  var decoded = blDecrypt(substr(response,0x38));
+  if (!isvalid(decoded) || strlen(decoded)<20) return false;
+  DEVICEID = substr(decoded,0,4);
+  KEY = substr(decoded,4,16);
+  AUTHENTICATED = true;
+  return true;
+}
+
+function sendRF(rfCodeHex)
+{
+  if (strlen(rfCodeHex)==0) {
+    log("BroadLink: RF-Code fehlt");
+    return false;
+  }
+  var rf = binary(rfCodeHex);
+  if (!isvalid(rf) || strlen(rf)==0) return false;
+  var payload = u16(strlen(rf)+4)+binary("02000000")+rf;
+  return isvalid(sendPacket(0x6A,payload));
+}
+
+// Dynamicactions: wie Helios ueber invokeAction ansteuern.
+function performRF(action)
+{
+  var code = "";
+  var title = "";
+  if (action=="TrocknerHoch") { code=RF_HOCH; title="Hoch"; }
+  else if (action=="TrocknerRunter") { code=RF_RUNTER; title="Runter"; }
+  else if (action=="TrocknerLicht") { code=RF_LICHT; title="Licht"; }
+  else if (action=="TrocknerLuefter") { code=RF_LUEFTER; title="Luefter"; }
+  else return false;
+
+  log("BroadLink: Aktion "+action);
+  if (strlen(code)==0) {
+    log("BroadLink: RF-Code nicht konfiguriert: "+action);
+    return false;
+  }
+  // Session wiederverwenden, solange sie funktioniert.
+  if (!AUTHENTICATED) {
+    if (!broadlinkAuth()) {
+      log("BroadLink: Authentifizierung fehlgeschlagen");
+      return false;
+    }
+  }
+  if (!sendRF(code)) {
+    // Bei abgelaufener Session genau einmal neu authentifizieren.
+    AUTHENTICATED = false;
+    log("BroadLink: RF Fehler, erneute Authentifizierung");
+    if (!broadlinkAuth() || !sendRF(code)) {
+      log("BroadLink: RF-Senden fehlgeschlagen: "+action);
+      return false;
+    }
+  }
+  message({message:"pushNotification",statechange:{Verbindung:"OK",LetzterBefehl:title},events:["RFGesendet"]});
+  log("BroadLink: RF-Befehl bestaetigt: "+title);
+  return true;
+}
+
+on (message()) as m {
+  if (m.message=="invokeAction") {
+    var ok = performRF(m.action);
+    if (!ok) {
+      message({message:"pushNotification",statechange:{Verbindung:"Fehler"},events:["RFFehler"]});
+    }
+    var errorCode = 1;
+    if (ok) {
+      errorCode = 0;
+    }
+    message({message:"confirmAction",action:m.action,errorcode:errorCode});
+  }
+}
+
+return true;

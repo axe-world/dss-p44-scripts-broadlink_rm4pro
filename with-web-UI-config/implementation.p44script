@@ -1,0 +1,625 @@
+// BroadLink RM4 Pro - RF-Lernen + persistente Dynamic Actions
+// NUR P44, keine Python-Bridge.
+//
+// RF-CODES via lokalem RF Manager verwalten.
+// API: /api/json/scriptapi/broadlinkrf
+// NEUEN RF-CODE LERNEN:
+// 1. Hier LEARN_NAME und LEARN_TITLE setzen (IDs nur A-Z, a-z, 0-9, _).
+// 2. Implementation-Script in P44Script-IDE speichern und neu starten.
+// 3. Dynamic Action 'eRFLernen' ausloesen.
+//    Wie im HTML-Manager wird apiStartLearn() verwendet.
+//    Fuer neue Codes LEARN_NAME und LEARN_TITLE anpassen.
+// 4. Bei 'Frequenzsuche': Taste der RF-Fernbedienung LANG halten.
+// 5. Bei 'RF-Aufnahme': Taste erneut KURZ druecken.
+// 6. Bei Erfolg: RF-Code im Flash gespeichert und neue Dynamic Action angelegt.
+// Ein vorhandener Name wird aus Sicherheitsgruenden NICHT ueberschrieben.
+// Alle RF-Actions werden aus der Datenbank beim Scriptstart registriert.
+// Die vier Trockner-Actions sind NICHT mehr in der Init-Message definiert.
+
+var LEARN_NAME = "NeuerRFCode";     // Gewuenschte Action-ID in der IDE eintragen
+var LEARN_TITLE = "Neuer RF-Code"; // Anzeigename in digitalSTROM
+var FREQUENCY_TIMEOUT = 25;       // Sekunden fuer langes Druecken
+var PACKET_TIMEOUT = 20;          // Sekunden fuer kurzes Druecken
+var DB_FILE = "broadlink_rm4pro_rf_5213.json";
+
+// Bestehende RF-Codes hier eintragen.
+// Beim ersten Start werden nicht-leere Codes in die JSON-Datei uebernommen.
+// Anschliessend koennen diese Variablen leer bleiben.
+var RF_HOCH = "";
+var RF_RUNTER = "";
+var RF_LICHT = "";
+var RF_LUEFTER = "";
+
+var HOST = "192.168.1.1";  //ANPASSEN !! IP des Broadlink RM4 Pro
+var PORT = 80;
+var KEY0 = binary("097628343fe99e23765c1513accf8b02");
+var IV = binary("562e17996d093d28ddb3ba695a2e6f58");
+var MAC = binary("60faedae0bec"); // MAC umgekehrt, wie im erfolgreichen Test
+var DEVTYPE = binary("1352");
+var KEY = KEY0;
+var DEVICEID = binary("00000000");
+var COUNTER = 0x8000;
+var AUTHENTICATED = false;
+var BUSY = false;
+var learnName = LEARN_NAME;
+var learnTitle = LEARN_TITLE;
+var learnPhase = "Inaktiv";
+var learnMessage = "Bereit";
+var lastError = "";
+var rfCodes = {};
+var databaseInvalid = false;
+// Gestueckelter Import fuer lange RF-Codes (keine langen GET-URLs).
+var rfUpload = null;
+var stateConnection = "Unbekannt";
+var stateCommand = "Keiner";
+var stateLearning = "Inaktiv";
+var stateLearnResult = "Unbekannt";
+
+function u16(n) { return chr(n%256)+chr(int(n/256)%256); }
+function setBytes(data,pos,value) {
+  return substr(data,0,pos)+value+substr(data,pos+strlen(value));
+}
+
+// Vorhandene schnellere Checksumme; auf MIPS bei grossen Daten pruefen.
+function checksum(data) {
+  var sum = 0xBEAF;
+  var len = strlen(data);
+  for (var b=1; b<256; b++) {
+    sum += b*(len-strlen(replace(data,chr(b),"")));
+  }
+  return sum%65536;
+}
+function zeroPad(data) {
+  while (strlen(data)%16!=0) data += chr(0);
+  return data;
+}
+function blEncrypt(data) {
+  var padded = zeroPad(data);
+  var encrypted = encrypt("AES-128-CBC",padded,KEY,IV,true);
+  return substr(encrypted,0,strlen(padded));
+}
+function blDecrypt(data) {
+  var n = strlen(data);
+  if (n==0 || n%16!=0) return null;
+  var lastBlock = substr(data,n-16,16);
+  var extra = encrypt("AES-128-CBC",strrep(chr(16),16),KEY,lastBlock,true);
+  return decrypt("AES-128-CBC",data+substr(extra,0,16),KEY,IV,true);
+}
+function sendPacket(command,payload) {
+  COUNTER = ((COUNTER+1)%32768)+32768;
+  var header = binary("5aa5aa555aa5aa55")+strrep(chr(0),48);
+  header = setBytes(header,0x24,DEVTYPE);
+  header = setBytes(header,0x26,u16(command));
+  header = setBytes(header,0x28,u16(COUNTER));
+  header = setBytes(header,0x2A,MAC);
+  header = setBytes(header,0x30,DEVICEID);
+  header = setBytes(header,0x34,u16(checksum(payload)));
+  var encrypted = blEncrypt(payload);
+  if (!isvalid(encrypted)) return null;
+  var packet = header+encrypted;
+  packet = setBytes(packet,0x20,u16(checksum(packet)));
+  var udp = udpsocket(HOST,PORT,true,true);
+  udp.send(packet);
+  var response = await(udp.message(),10);
+  if (!isvalid(response) || strlen(response)<56) {
+    log("BroadLink: Timeout / kurze Antwort");
+    return null;
+  }
+  var err = ord(substr(response,0x22,1))+256*ord(substr(response,0x23,1));
+  if (err!=0) {
+    log("BroadLink: Fehlercode "+err);
+    return null;
+  }
+  return response;
+}
+function broadlinkAuth() {
+  AUTHENTICATED = false;
+  KEY = KEY0;
+  DEVICEID = binary("00000000");
+  var payload = strrep(chr(0),80);
+  payload = setBytes(payload,4,strrep("1",16));
+  payload = setBytes(payload,0x1E,chr(1));
+  payload = setBytes(payload,0x2D,chr(1));
+  payload = setBytes(payload,0x30,"Test 1");
+  var response = sendPacket(0x65,payload);
+  if (!isvalid(response)) return false;
+  var decoded = blDecrypt(substr(response,0x38));
+  if (!isvalid(decoded) || strlen(decoded)<20) return false;
+  DEVICEID = substr(decoded,0,4);
+  KEY = substr(decoded,4,16);
+  AUTHENTICATED = true;
+  return true;
+}
+function rm4Command(subcommand,data) {
+  // RM4: zwei Bytes Nutzlastlaenge + vier Bytes Unterbefehl + Daten.
+  var payload = u16(strlen(data)+4)+u16(subcommand)+binary("0000")+data;
+  var response = sendPacket(0x6A,payload);
+  if (!isvalid(response)) return null;
+  var decoded = blDecrypt(substr(response,0x38));
+  if (!isvalid(decoded) || strlen(decoded)<6) return null;
+  var n = ord(substr(decoded,0,1))+256*ord(substr(decoded,1,1));
+  if (n<4 || n+2>strlen(decoded)) {
+    log("BroadLink: ungueltiger RM4 Antwortheader");
+    return null;
+  }
+  return substr(decoded,6,n-4);
+}
+function ensureAuth() {
+  if (AUTHENTICATED) return true;
+  return broadlinkAuth();
+}
+function validActionId(id) {
+  if (strlen(id)<1 || strlen(id)>48) return false;
+  var permitted = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_";
+  for (var i=0; i<strlen(id); i++) {
+    if (strlen(replace(permitted,substr(id,i,1),""))==strlen(permitted)) return false;
+  }
+  return true;
+}
+function knownAction(id) {
+  // Action-IDs fuer die Lernsteuerung duerfen nicht als RF-Codes vergeben werden.
+  return id=="eRFLernen" || id=="RFLernen";
+}
+function saveDB() {
+  if (databaseInvalid) {
+    log("BroadLink: Datenbank beschaedigt; Speichern gesperrt");
+    return false;
+  }
+  // writefile schreibt JSON-Objekt als Text ins persistente Datenverzeichnis.
+  var result = writefile(DB_FILE,rfCodes);
+  if (!isok(result)) {
+    log("BroadLink: Fehler beim Speichern der RF-Datenbank");
+    return false;
+  }
+  log("BroadLink: RF-Datenbank gespeichert: "+DB_FILE);
+  return true;
+}
+function loadDB() {
+  var contents = null;
+  var fileMissing = false;
+  try {
+    contents = readfile(DB_FILE);
+  }
+  catch as err {
+    var errText = ""+err;
+    if (replace(errText,"No such file or directory","")!=errText ||
+        replace(errText,"no such file or directory","")!=errText) {
+      fileMissing = true;
+      log("BroadLink: RF-Datenbank fehlt, lege neue Datei an: "+DB_FILE);
+    }
+    else {
+      databaseInvalid = true;
+      log("BroadLink: RF-Datenbank nicht lesbar, Schreibschutz aktiviert: "+errText);
+      return false;
+    }
+  }
+  if (fileMissing) {
+    rfCodes = {};
+    // Leere Datei anlegen. Nicht als defekte Datenbank behandeln.
+    // Vorhandene Legacy-RF-Codes werden danach von addLegacy() importiert.
+    if (!saveDB()) {
+      databaseInvalid = true;
+      log("BroadLink: Konnte RF-Datenbank nicht anlegen");
+      return false;
+    }
+    return true;
+  }
+  if (!isvalid(contents) || strlen(contents)==0) {
+    databaseInvalid = true;
+    log("BroadLink: RF-Datenbank leer oder unlesbar, kein Ueberschreiben");
+    return false;
+  }
+  try {
+    var parsed = json(contents);
+    if (isok(parsed) && isvalid(parsed)) {
+      rfCodes = parsed;
+      log("BroadLink: RF-Datenbank geladen");
+      return true;
+    }
+  }
+  catch as err {
+    log("BroadLink: JSON-Fehler: "+err);
+  }
+  databaseInvalid = true;
+  log("BroadLink: RF-Datenbank ungueltig, Schreibschutz aktiviert");
+  return false;
+}
+// P44Script wirft ScriptError::NotFound bei rfCodes[id] fuer unbekannte IDs.
+// Der direkte Zugriff wird auch in try/catch nicht zuverlaessig abgefangen.
+// Daher ausschliesslich die vorhandenen Schluessel mit foreach vergleichen.
+// Insbesondere bei NEUEN Lern-IDs darf kein Objektzugriff auf einen
+// noch nicht existierenden Schluessel stattfinden.
+function rfEntry(id) {
+  foreach rfCodes as entryId,entry {
+    if (entryId==id) return entry;
+  }
+  return null;
+}
+function addLegacy(id,title,code) {
+  if (strlen(code)==0) return;
+  if (isvalid(rfEntry(id))) return;
+  rfCodes[id] = {title:title,code:code};
+  saveDB();
+}
+function publishAction(id,title) {
+  var changes = {};
+  changes[id] = {title:title,description:"Gespeicherten BroadLink RF-Code senden"};
+  message({message:"dynamicAction",changes:changes});
+}
+function restoreActions() {
+  foreach rfCodes as id,entry {
+    if (validActionId(id) && isvalid(entry.code) && strlen(entry.code)>0) {
+      publishAction(id,entry.title);
+    }
+  }
+}
+function pushState(id,value) {
+  var last = "";
+  if (id=="Verbindung") last=stateConnection;
+  if (id=="LetzterBefehl") last=stateCommand;
+  if (id=="Lernmodus") last=stateLearning;
+  if (id=="Lernergebnis") last=stateLearnResult;
+  if (id=="Lernmodus") learnPhase=value;
+  if (last==value) return;
+  if (id=="Verbindung") stateConnection=value;
+  if (id=="LetzterBefehl") stateCommand=value;
+  if (id=="Lernmodus") stateLearning=value;
+  if (id=="Lernergebnis") stateLearnResult=value;
+  var changes={};
+  changes[id]=value;
+  message({message:"pushNotification",statechange:changes});
+}
+function emitEvent(id) { message({message:"pushNotification",events:[id]}); }
+function rfSend(action) {
+  var entry = rfEntry(action);
+  if (!isvalid(entry) || !isvalid(entry.code) || strlen(entry.code)==0) {
+    log("BroadLink: kein gespeicherter RF-Code fuer "+action);
+    return false;
+  }
+  if (!ensureAuth()) return false;
+  var rf = binary(entry.code);
+  if (!isvalid(rf) || strlen(rf)==0) return false;
+  var response = rm4Command(0x02,rf);
+  if (!isvalid(response)) {
+    AUTHENTICATED=false;
+    if (!broadlinkAuth()) return false;
+    response=rm4Command(0x02,rf);
+  }
+  if (!isvalid(response)) return false;
+  pushState("Verbindung","OK");
+  // 'LetzterBefehl' hat ein festes Enum aus dem Init-Script.
+  if (action=="TrocknerHoch") pushState("LetzterBefehl","Hoch");
+  if (action=="TrocknerRunter") pushState("LetzterBefehl","Runter");
+  if (action=="TrocknerLicht") pushState("LetzterBefehl","Licht");
+  if (action=="TrocknerLuefter") pushState("LetzterBefehl","Luefter");
+  emitEvent("RFGesendet");
+  log("BroadLink: RF erfolgreich: "+action);
+  return true;
+}
+function rfLearn() {
+  if (!validActionId(learnName) || knownAction(learnName)) {
+    log("BroadLink: ungueltiger/reservierter LEARN_NAME");
+    return false;
+  }
+  if (isvalid(rfEntry(learnName))) {
+    log("BroadLink: Code existiert bereits, wird NICHT ueberschrieben: "+learnName);
+    return false;
+  }
+  if (!ensureAuth()) return false;
+  pushState("Verbindung","OK");
+  pushState("Lernergebnis","Unbekannt");
+  pushState("Lernmodus","Frequenzsuche");
+  log("RF-LERNEN: Taste jetzt LANG halten: "+learnName);
+  if (!isvalid(rm4Command(0x19,""))) {
+    pushState("Lernmodus","Inaktiv");
+    return false;
+  }
+  var frequencyOK=false;
+  var start = epochtime();
+  while (epochtime()-start<FREQUENCY_TIMEOUT) {
+    delay(0.8);
+    var freq = rm4Command(0x1A,"");
+    if (isvalid(freq) && strlen(freq)>=5 && ord(substr(freq,0,1))!=0) {
+      var khz=ord(substr(freq,1,1))+256*ord(substr(freq,2,1))+65536*ord(substr(freq,3,1))+16777216*ord(substr(freq,4,1));
+      log("BroadLink: Frequenz gefunden: "+(khz/1000)+" MHz");
+      frequencyOK=true;
+      break;
+    }
+  }
+  if (!frequencyOK) {
+    log("BroadLink: keine RF-Frequenz gefunden");
+    rm4Command(0x1E,"");
+    pushState("Lernmodus","Inaktiv");
+    pushState("Lernergebnis","Fehler");
+    emitEvent("RFLernfehler");
+    return false;
+  }
+  pushState("Lernmodus","Empfangen");
+  if (!isvalid(rm4Command(0x1B,""))) {
+    pushState("Lernmodus","Inaktiv");
+    pushState("Lernergebnis","Fehler");
+    emitEvent("RFLernfehler");
+    return false;
+  }
+  log("RF-LERNEN: Taste jetzt erneut KURZ druecken");
+  var captured=null;
+  start=epochtime();
+  while (epochtime()-start<PACKET_TIMEOUT) {
+    delay(0.8);
+    var packet=rm4Command(0x04,"");
+    if (isvalid(packet) && strlen(packet)>8) {
+      captured=packet;
+      break;
+    }
+  }
+  rm4Command(0x1E,"");
+  pushState("Lernmodus","Inaktiv");
+  if (!isvalid(captured)) {
+    log("BroadLink: kein RF-Paket empfangen");
+    pushState("Lernergebnis","Fehler");
+    emitEvent("RFLernfehler");
+    return false;
+  }
+  var id=learnName;
+  var title=learnTitle;
+  if (strlen(title)==0) title=id;
+  var beforeLearn=rfCodes;
+  var learnedCodes={};
+  foreach rfCodes as entryId,entry {
+    if (isvalid(entry) && isvalid(entry.code)) learnedCodes[entryId]=entry;
+  }
+  learnedCodes[id]={title:title,code:hex(captured)};
+  rfCodes=learnedCodes;
+  if (!saveDB()) {
+    rfCodes=beforeLearn;
+    pushState("Lernergebnis","Fehler");
+    emitEvent("RFLernfehler");
+    return false;
+  }
+  publishAction(id,title);
+  pushState("Lernergebnis","Erfolgreich");
+  emitEvent("RFCodeGelernt");
+  log("BroadLink: RF gelernt und gespeichert: "+id+" ("+strlen(captured)+" Bytes)");
+  return true;
+}
+
+// Beim Start bereits vorhandene Codes uebernehmen und Actions registrieren.
+loadDB();
+addLegacy("TrocknerHoch","Trockner hoch",RF_HOCH);
+addLegacy("TrocknerRunter","Trockner runter",RF_RUNTER);
+addLegacy("TrocknerLicht","Trockner Licht",RF_LICHT);
+addLegacy("TrocknerLuefter","Trockner Luefter",RF_LUEFTER);
+delay(0.2);
+restoreActions();
+message({message:"pushNotification",statechange:{Verbindung:"Unbekannt",LetzterBefehl:"Keiner",Lernmodus:"Inaktiv",Lernergebnis:"Unbekannt"}});
+
+
+
+// ------------------------------------------------------------------
+// HTTP JSON API for BroadLink RF Manager
+// GET /api/json/scriptapi/broadlinkrf?cmd=list
+// GET ...?cmd=learn&id=...&title=...
+// GET ...?cmd=send&id=...
+// GET ...?cmd=rename&id=...&title=...
+// GET ...?cmd=save&id=...&title=...&code=...
+// GET ...?cmd=remove&id=...
+// GET ...?cmd=status
+// Only enable this on a protected local P44. Commands are NOT read-only!
+// ------------------------------------------------------------------
+function rfApiList() {
+  // Return all data, including hex codes, to allow editing / backup in UI.
+  return {ok:true, codes:rfCodes, busy:BUSY, phase:learnPhase, info:learnMessage, error:lastError};
+}
+function rfApiError(reason) { return {ok:false,error:reason}; }
+function rfCodeHexValid(code) {
+  if (!isvalid(code) || strlen(code)<2 || strlen(code)%2!=0 || strlen(code)>32000) return false;
+  var hexChars="0123456789abcdefABCDEF";
+  for (var i=0; i<strlen(code); i++) {
+    if (strlen(replace(hexChars,substr(code,i,1),""))==strlen(hexChars)) return false;
+  }
+  return true;
+}
+// cmd=save wird von der HTML-Seite fuer NEU und BEARBEITEN benutzt.
+// Titel und/oder RF-Daten einer bestehenden Action duerfen aktualisiert werden.
+function apiSave(id,title,code) {
+  if (BUSY || databaseInvalid) return rfApiError("Geraet beschaeftigt oder Datenbank schreibgeschuetzt");
+  if (!validActionId(id) || knownAction(id)) return rfApiError("Ungueltige oder reservierte Action-ID");
+  if (!rfCodeHexValid(code)) return rfApiError("Ungueltiger RF-Hex-Code");
+  if (!isvalid(title) || strlen(title)<1 || strlen(title)>100) return rfApiError("Ungueltiger Anzeigename");
+  var beforeSave=rfCodes;
+  var updated={};
+  foreach rfCodes as entryId,entry {
+    if (isvalid(entry) && isvalid(entry.code)) updated[entryId]=entry;
+  }
+  updated[id]={title:title,code:code};
+  rfCodes=updated;
+  if (!saveDB()) {
+    rfCodes=beforeSave;
+    return rfApiError("Datei konnte nicht geschrieben werden");
+  }
+  publishAction(id,title);
+  return {ok:true,id:id};
+}
+// Langen RF-Hex-Code in kleinen Teilen uebertragen. Nur der Commit
+// schreibt persistent und veroeffentlicht die Dynamic Action.
+function apiUploadBegin(id,title,total) {
+  if (BUSY || databaseInvalid) return rfApiError("Geraet beschaeftigt oder Datenbank schreibgeschuetzt");
+  if (!validActionId(id) || knownAction(id)) return rfApiError("Ungueltige oder reservierte Action-ID");
+  if (!isvalid(title) || strlen(title)<1 || strlen(title)>100) return rfApiError("Ungueltiger Anzeigename");
+  var n=int(total);
+  if (n<2 || n>32000 || n%2!=0) return rfApiError("Ungueltige RF-Code-Laenge");
+  rfUpload={id:id,title:title,total:n,code:"",next:0};
+  return {ok:true,started:true};
+}
+function apiUploadPart(id,seq,part) {
+  if (!isvalid(rfUpload)) return rfApiError("Kein aktiver Upload");
+  if (id!=rfUpload.id || int(seq)!=rfUpload.next) return rfApiError("Falsche Upload-Reihenfolge");
+  if (!rfCodeHexValid(part) || strlen(part)>320) return rfApiError("Ungueltiger Upload-Block");
+  if (strlen(rfUpload.code)+strlen(part)>rfUpload.total) return rfApiError("RF-Code ueberschreitet angekuendigte Laenge");
+  rfUpload={id:rfUpload.id,title:rfUpload.title,total:rfUpload.total,code:rfUpload.code+part,next:rfUpload.next+1};
+  return {ok:true,next:rfUpload.next,received:strlen(rfUpload.code)};
+}
+function apiUploadCommit(id) {
+  if (!isvalid(rfUpload) || id!=rfUpload.id) return rfApiError("Kein passender Upload");
+  if (strlen(rfUpload.code)!=rfUpload.total) return rfApiError("RF-Code unvollstaendig");
+  var title=rfUpload.title;
+  var code=rfUpload.code;
+  rfUpload=null;
+  return apiSave(id,title,code);
+}
+function apiUploadCancel() { rfUpload=null; return {ok:true}; }
+function apiRename(id,title) {
+  if (BUSY || databaseInvalid) return rfApiError("Geraet beschaeftigt");
+  var previous=rfEntry(id);
+  if (!isvalid(previous)) return rfApiError("Code nicht gefunden");
+  if (!isvalid(title) || strlen(title)<1 || strlen(title)>100) return rfApiError("Ungueltiger Name");
+  // Neues Objekt erzeugen statt das bereits gespeicherte Objekt zu mutieren.
+  rfCodes[id]={title:title,code:previous.code};
+  if (!saveDB()) {
+    rfCodes[id]=previous;
+    return rfApiError("Speichern fehlgeschlagen");
+  }
+  publishAction(id,title);
+  return {ok:true,id:id};
+}
+// Action-ID umbenennen, OHNE den bis zu 32 KB langen RF-Code ueber HTTP
+// neu zu uebertragen. Aenderung der ID kann dSS-Szenariozuordnungen
+// beeinflussen; anschliessend im Konfigurator Geraetestatus aktualisieren.
+function apiMove(oldId,newId,title) {
+  if (BUSY || databaseInvalid) return rfApiError("Geraet beschaeftigt oder Datenbank schreibgeschuetzt");
+  if (!validActionId(oldId) || !validActionId(newId) || knownAction(newId)) return rfApiError("Ungueltige Action-ID");
+  if (!isvalid(title) || strlen(title)<1 || strlen(title)>100) return rfApiError("Ungueltiger Anzeigename");
+  var previous=rfEntry(oldId);
+  if (!isvalid(previous) || !isvalid(previous.code)) return rfApiError("Bisherige Action nicht vorhanden");
+  if (oldId==newId) return apiRename(oldId,title);
+  if (isvalid(rfEntry(newId))) return rfApiError("Neue Action-ID existiert bereits: "+newId);
+  // Datenbank mit nur echten Eintraegen neu aufbauen, damit die
+  // alte Action-ID auch aus der JSON-Datei vollstaendig verschwindet.
+  var updated={};
+  foreach rfCodes as entryId,entry {
+    if (entryId!=oldId && isvalid(entry) && isvalid(entry.code)) updated[entryId]=entry;
+  }
+  updated[newId]={title:title,code:previous.code};
+  var before=rfCodes;
+  rfCodes=updated;
+  if (!saveDB()) {
+    rfCodes=before;
+    return rfApiError("Datenbank konnte nicht geschrieben werden");
+  }
+  // Zuerst neue Aktion registrieren, dann die alte abmelden.
+  publishAction(newId,title);
+  var changes={}; changes[oldId]=null;
+  message({message:"dynamicAction",changes:changes});
+  return {ok:true,oldId:oldId,id:newId};
+}
+function apiRemove(id) {
+  if (BUSY || databaseInvalid) return rfApiError("Geraet beschaeftigt");
+  var previous=rfEntry(id);
+  if (!isvalid(previous)) return rfApiError("Code nicht vorhanden");
+  var before=rfCodes;
+  var updated={};
+  foreach rfCodes as entryId,entry {
+    if (entryId!=id && isvalid(entry) && isvalid(entry.code)) updated[entryId]=entry;
+  }
+  rfCodes=updated;
+  if (!saveDB()) {
+    rfCodes=before;
+    return rfApiError("Loeschen fehlgeschlagen");
+  }
+  var changes={}; changes[id]=null;
+  message({message:"dynamicAction",changes:changes});
+  return {ok:true};
+}
+function apiStartLearn(id,title) {
+  if (BUSY || databaseInvalid) return rfApiError("Geraet beschaeftigt");
+  if (!validActionId(id) || knownAction(id)) return rfApiError("Action-ID ungueltig/reserviert");
+  if (isvalid(rfEntry(id))) return rfApiError("Action-ID existiert bereits");
+  if (!isvalid(title) || strlen(title)<1 || strlen(title)>100) return rfApiError("Anzeigename ungueltig");
+  learnName=id; learnTitle=title;
+  learnMessage="Frequenzsuche startet"; lastError="";
+  BUSY=true;
+  concurrent {
+    var learned=false;
+    try { learned=rfLearn(); }
+    catch as err { lastError="Lernfehler: "+err; log("BroadLink: "+lastError); }
+    if (!learned) {
+      if (strlen(lastError)==0) lastError="Lernvorgang fehlgeschlagen oder Timeout";
+      pushState("Lernmodus","Inaktiv");
+      pushState("Lernergebnis","Fehler");
+      emitEvent("RFLernfehler");
+      learnMessage=lastError;
+    }
+    else { learnMessage="Code "+learnName+" gespeichert"; lastError=""; }
+    BUSY=false;
+  }
+  return {ok:true,started:true,id:id};
+}
+function apiSend(id) {
+  if (BUSY) return rfApiError("Geraet beschaeftigt");
+  if (!isvalid(rfEntry(id))) return rfApiError("Code nicht vorhanden");
+  BUSY=true;
+  concurrent {
+    var ok=false;
+    try { ok=rfSend(id); }
+    catch as err { lastError="RF-Sendefehler: "+err; log(lastError); }
+    if (!ok) {pushState("Verbindung","Fehler");emitEvent("RFFehler");}
+    BUSY=false;
+  }
+  return {ok:true,started:true};
+}
+
+on (webrequest("broadlinkrf")) as req {
+  var answer={ok:false,error:"Unbekanntes Kommando"};
+  try {
+    var cmd=ifok(req.cmd, "list");
+    if (cmd=="list" || cmd=="status") answer=rfApiList();
+    else if (cmd=="learn") answer=apiStartLearn(req.id,req.title);
+    else if (cmd=="send") answer=apiSend(req.id);
+    else if (cmd=="rename") answer=apiRename(req.id,req.title);
+    else if (cmd=="move") answer=apiMove(req.oldId,req.id,req.title);
+    else if (cmd=="remove") answer=apiRemove(req.id);
+    else if (cmd=="save") answer=apiSave(req.id,req.title,req.code);
+    else if (cmd=="uploadBegin") answer=apiUploadBegin(req.id,req.title,req.total);
+    else if (cmd=="uploadPart") answer=apiUploadPart(req.id,req.seq,req.part);
+    else if (cmd=="uploadCommit") answer=apiUploadCommit(req.id);
+    else if (cmd=="uploadCancel") answer=apiUploadCancel();
+  }
+  catch as err { answer=rfApiError("API-Ausnahme: "+err); log("BroadLink API: "+err); }
+  // ALWAYS answer, otherwise the browser waits until timeout.
+  req.answer(answer);
+}
+
+// Lernen laeuft absichtlich asynchron. confirmAction bestaetigt nur
+// den Start des Lernvorgangs, NICHT den erfolgreichen Codeempfang.
+// Erfolg/Fehler wird ueber Lernergebnis und Events signalisiert.
+on (message()) as m {
+  if (m.message=="invokeAction") {
+    if (m.action=="eRFLernen" || m.action=="RFLernen") {
+      // Derselbe Einstieg wie bei der HTML-Seite (cmd=learn).
+      // Die Action hat keine Parameter: Standard-ID/-Titel aus der IDE verwenden.
+      var response=apiStartLearn(LEARN_NAME,LEARN_TITLE);
+      var errorCode=1;
+      if (response.ok) errorCode=0;
+      else log("BroadLink: RF lernen nicht gestartet: "+response.error);
+      message({message:"confirmAction",action:m.action,errorcode:errorCode});
+    }
+    else {
+      var ok=false;
+      if (!BUSY) {
+        BUSY=true;
+        try { ok=rfSend(m.action); }
+        catch as e { log("BroadLink: Sende-Ausnahme: "+e); }
+        BUSY=false;
+      }
+      else log("BroadLink: RF-Lernvorgang laeuft bereits");
+      if (!ok) {
+        pushState("Verbindung","Fehler");
+        emitEvent("RFFehler");
+      }
+      var errorCode=1;
+      if (ok) errorCode=0;
+      message({message:"confirmAction",action:m.action,errorcode:errorCode});
+    }
+  }
+}
+return true;
